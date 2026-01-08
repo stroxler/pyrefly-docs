@@ -1,73 +1,325 @@
-# Transactional Var Pinning: Design Notes
+# Transactional Var Pinning: Fresh Implementation Guide
 
-This document provides a design for eliminating nondeterminism in Pyrefly's type inference
-by isolating cycle resolution to individual threads.
-
-**Companion documents:**
-- `worked-example.md` - Detailed trace of A → B → A cycle showing exact call sequence
-- `review-feedback.md` - Corrections and clarifications based on code review
+This document provides a complete implementation guide for eliminating nondeterminism in
+Pyrefly's cycle resolution. It assumes a fresh start on top of the transactional errors
+implementation already on trunk.
 
 ---
 
 ## Problem Statement
 
-Pyrefly has nondeterminism issues stemming from `Type::Var` values leaking to global storage
-before they're fully resolved. When answers are computed using unresolved `Var` placeholders,
-the results may differ from what you'd get with the final resolved types.
+Pyrefly has nondeterminism issues when multiple threads compute the same binding in a cycle:
 
-**Root cause:** Non-idempotent computation. Computing with placeholders produces different
-results (and errors) than computing with final types.
+1. All threads call `K::solve` and generate errors
+2. Only the first thread to call `record_value` "wins"
+3. Other threads' values and errors are discarded (or worse, duplicated)
+
+**Root cause:** Non-idempotent computation. Computing with placeholder types produces different
+results (and errors) than computing with final resolved types.
 
 ---
 
-## High-Level Approach
+## What's Already Implemented
+
+**Transactional Errors (D90268296):** The `record_value` method now returns `(T, bool)`:
+
+```rust
+pub fn record_value(&self, value: T, on_recursive: impl FnOnce(R, T) -> T) -> (T, bool) {
+    // Returns (value, true) if we wrote our value
+    // Returns (existing_value, false) if another thread's value was used
+}
+```
+
+In `calculate_and_record_answer`, errors are buffered locally and only committed when
+`record_value` returns `true`:
+
+```rust
+let error_buffer = ErrorCollector::new(...);
+let computed_answer = K::solve(self, binding, &error_buffer);
+let (answer, we_wrote) = calculation.record_value(computed_answer, ...);
+if we_wrote {
+    self.base_errors.extend(error_buffer);
+}
+```
+
+This solves multi-thread error duplication for **non-cycle** cases. For cycles, we need
+additional work because pass 1 (tentative) and pass 2 (canonical) both generate errors.
+
+---
+
+## Solution: Two-Pass Cycle Resolution
 
 ### The Three-Value Model
 
-For each cycle with break_at idx B, there are three types:
+For each cycle with break_at binding B:
 
 1. **T_B0** (placeholder): `Any` or `Variable::Recursive`, stored when cycle detected
-2. **T_B1** (tentative final): Result of first traversal using T_B0, **committed to global**
-3. **T_B2** (stability check): Result of second traversal using T_B1, **diagnostic only**
+2. **T_B1** (tentative): Result of pass 1 using T_B0
+3. **T_B2** (canonical): Result of pass 2 using T_B1, **this is what gets committed**
 
 ### The Core Invariant
 
-**Pass N for the cycle uses Pass N-1 result for break_at**
+**Pass N uses Pass N-1 result for break_at.**
 
-This ensures all bindings in the cycle observe a consistent value for break_at: the Pass N-1
-result. This is why T_B1 (not T_B2) is committed—D, E, F were all computed using T_B1, so
-using T_B2 would create inconsistency between break_at's type and its dependencies' types.
+This ensures all bindings in the cycle observe a consistent value for break_at.
 
 ### Two-Pass Protocol
 
-**Pass 1 (Tentative Computation):**
-- Store T_B0 in `Cycle.preliminary_answers`
-- Call `K::solve(break_at)` → computes T_B1
-  - Dependencies call `get_idx()` → see T_B0 for recursion
-  - Other bindings D, E, F... computed and stored in `preliminary_answers`
-- Commit T_B1 to global `Calculation`
-- Clear `preliminary_answers`
+**Pass 1 (Tentative):**
+- Store T_B0 in PreliminaryAnswers when cycle detected
+- Compute break_at and all dependencies
+- Store ALL results in PreliminaryAnswers only (NOT in global Calculation)
+- Errors from pass 1 are NOT committed (because no record_value call)
 
-**Pass 2 (Canonical Computation):**
-- Call `K::solve(break_at)` → computes T_B2
-  - Dependencies call `get_idx()` → see T_B1 from global
-  - Other bindings D, E, F... recompute using T_B1
-  - Write D, E, F to global `Calculation`
-- Compare T_B2 to T_B1
-  - If different: warn "unstable cycle resolution"
-  - Keep T_B1 (discard T_B2)
+**Pass 2 (Canonical):**
+- Keep T_B1 in PreliminaryAnswers for break_at
+- Track all non-break_at participants as "pass 2 participants" in ThreadState
+- Recompute by calling K::solve on break_at
+- When dependencies are accessed via get_idx:
+  - If it's a pass 2 participant: bypass propose_calculation, compute directly, store in PreliminaryAnswers
+  - If it's break_at: return T_B1 from PreliminaryAnswers
+  - Otherwise: use normal Calculation path
+- After pass 2 completes: call record_value for ALL participants to finalize
+- Errors from pass 2 ARE committed (via transactional error mechanism when record_value succeeds)
 
-**Result:** All bindings in the cycle are based on T_B1 (consistent).
+**Result:** Deterministic errors based on resolved types, not placeholders.
 
 ---
 
-## Architecture
+## Key Implementation Challenge: Calculation States
 
-### Component 1: PreliminaryAnswers (Per-Cycle)
+### Understanding the Problem
 
-**Location:** `pyrefly/lib/alt/answers_solver.rs`
+The `Calculation` state machine has three states:
 
-**Structure:**
+```rust
+enum Status<T, R> {
+    NotCalculated,
+    Calculating(CalculatingStatus<R>),  // Contains thread ID
+    Calculated(T),
+}
+```
+
+When a binding B is being computed:
+1. `propose_calculation(B)` transitions: NotCalculated → Calculating(thread_id)
+2. If B depends on D, D also transitions to Calculating
+3. If D depends back on B, `propose_calculation(B)` sees Calculating with same thread_id → CycleDetected
+
+**Critical insight:** During cycle resolution, all participants are in `Calculating` state,
+not `NotCalculated`. This affects how pass 2 works.
+
+### The State Flow
+
+**During pass 1:**
+```
+B: NotCalculated → Calculating → (stays Calculating during cycle)
+D: NotCalculated → Calculating → (stays Calculating during cycle)
+E: NotCalculated → Calculating → (stays Calculating during cycle)
+```
+
+**After pass 1 completes (current behavior):**
+```
+B: Calculating → Calculated(T_B1) via record_value
+D: Calculating → Calculated(T_D1) via record_value
+```
+
+**New behavior needed:**
+```
+Pass 1: Store to PreliminaryAnswers, stay in Calculating
+Pass 2:
+  - B (break_at): stays Calculating, T_B1 available in PreliminaryAnswers
+  - D: stays Calculating, but tracked as pass2_participant so get_idx bypasses propose_calculation
+  - E: stays Calculating, but tracked as pass2_participant so get_idx bypasses propose_calculation
+After pass 2 completes:
+  - B: Calculating → Calculated(T_B1 or T_B2) via record_value
+  - D: Calculating → Calculated(T_D2) via record_value
+  - E: Calculating → Calculated(T_E2) via record_value
+```
+
+**Key insight:** Calculations are NEVER reset. They stay in `Calculating` state throughout
+cycle resolution. All intermediate results live in thread-local PreliminaryAnswers.
+Only after pass 2 completes do we call record_value to finalize.
+
+---
+
+## Implementation Plan
+
+### Step 1: Add SparseIndexMap for Preliminary Storage
+
+Create `pyrefly_graph/src/sparse_index_map.rs`:
+
+```rust
+use std::marker::PhantomData;
+use starlark_map::small_map::SmallMap;
+use crate::index::Idx;
+
+/// A sparse mapping from Idx<K> to V, using a SmallMap for efficiency when few entries.
+///
+/// This is similar to IndexMap but uses sparse storage (SmallMap) instead of dense storage (Vec).
+/// It's designed for scenarios where only a small subset of indices will have values, such as
+/// storing preliminary answers during cycle resolution.
+#[derive(Debug, Clone)]
+pub struct SparseIndexMap<K, V> {
+    items: SmallMap<usize, V>,
+    phantom: PhantomData<K>,
+}
+
+impl<K, V> Default for SparseIndexMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K, V> SparseIndexMap<K, V> {
+    pub fn new() -> Self {
+        Self {
+            items: SmallMap::new(),
+            phantom: PhantomData,
+        }
+    }
+
+    pub fn get(&self, idx: Idx<K>) -> Option<&V> {
+        self.items.get(&idx.idx())
+    }
+
+    pub fn insert(&mut self, idx: Idx<K>, value: V) -> Option<V> {
+        self.items.insert(idx.idx(), value)
+    }
+
+    pub fn clear(&mut self) {
+        self.items.clear()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+}
+```
+
+Export it from `pyrefly_graph/src/lib.rs`:
+
+```rust
+pub mod sparse_index_map;
+```
+
+### Step 2: Create TypeErasedPreliminaryAnswers
+
+Add to `pyrefly/lib/alt/answers_solver.rs`:
+
+```rust
+use std::any::Any;
+use std::any::TypeId;
+
+/// Key for type-erased preliminary answer storage.
+/// Uniquely identifies an answer by module, key type, and index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TypeErasedKey {
+    module_name: ModuleName,
+    key_type: TypeId,
+    index: usize,
+}
+
+/// Type-erased storage for preliminary answers and their associated errors.
+///
+/// This stores answers as `Arc<dyn Any + Send + Sync>` to avoid cascading trait
+/// bounds when recording preliminary answers from generic contexts.
+/// Errors are stored separately keyed by CalcId.
+#[derive(Debug, Default)]
+pub struct TypeErasedPreliminaryAnswers {
+    answers: RefCell<SmallMap<TypeErasedKey, Arc<dyn Any + Send + Sync>>>,
+    errors: RefCell<SmallMap<CalcId, ErrorCollector>>,
+}
+
+impl Clone for TypeErasedPreliminaryAnswers {
+    fn clone(&self) -> Self {
+        Self {
+            answers: RefCell::new(self.answers.borrow().clone()),
+            errors: RefCell::new(SmallMap::new()), // Errors are not cloned
+        }
+    }
+}
+
+impl TypeErasedPreliminaryAnswers {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record an answer in type-erased storage.
+    pub fn record<K: Keyed>(&self, module: &ModuleInfo, idx: Idx<K>, answer: Arc<K::Answer>)
+    where
+        K::Answer: Any + Send + Sync,
+    {
+        let key = TypeErasedKey {
+            module_name: module.name().clone(),
+            key_type: TypeId::of::<K>(),
+            index: idx.idx(),
+        };
+        self.answers.borrow_mut().insert(key, answer);
+    }
+
+    /// Get an answer from type-erased storage, downcasting to the expected type.
+    pub fn get<K: Keyed>(&self, module: &ModuleInfo, idx: Idx<K>) -> Option<Arc<K::Answer>>
+    where
+        K::Answer: Any + Send + Sync + Clone,
+    {
+        let key = TypeErasedKey {
+            module_name: module.name().clone(),
+            key_type: TypeId::of::<K>(),
+            index: idx.idx(),
+        };
+        let borrow = self.answers.borrow();
+        let any_arc = borrow.get(&key)?;
+        // Downcast from Arc<dyn Any> to Arc<K::Answer>
+        any_arc
+            .downcast_ref::<K::Answer>()
+            .map(|answer| Arc::new(answer.clone()))
+    }
+
+    /// Record errors associated with a CalcId.
+    pub fn record_errors(&self, calc_id: &CalcId, errors: ErrorCollector) {
+        self.errors.borrow_mut().insert(calc_id.clone(), errors);
+    }
+
+    /// Get errors associated with a CalcId.
+    pub fn get_errors(&self, calc_id: &CalcId) -> Option<ErrorCollector> {
+        self.errors.borrow_mut().remove(calc_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.answers.borrow().is_empty()
+    }
+
+    pub fn clear(&self) {
+        self.answers.borrow_mut().clear();
+        self.errors.borrow_mut().clear();
+    }
+
+    pub fn len(&self) -> usize {
+        self.answers.borrow().len()
+    }
+}
+```
+
+**Important:** This requires adding bounds to `Keyed::Answer` in `binding.rs`:
+
+```rust
+pub trait Keyed: Hash + Eq + Clone + DisplayWith<ModuleInfo> + Debug + Ranged + 'static {
+    const EXPORTED: bool = false;
+    type Value: Debug + DisplayWith<Bindings>;
+    /// Answer type must be thread-safe for type-erased storage during cycle resolution.
+    type Answer: Clone + Debug + Display + TypeEq + VisitMut<Type> + Send + Sync + 'static;
+    fn to_anyidx(idx: Idx<Self>) -> AnyIdx;
+}
+```
+
+### Step 3: Add PreliminaryAnswers to Cycle
+
+Modify the `Cycle` struct:
+
 ```rust
 pub struct Cycle {
     break_at: CalcId,
@@ -75,684 +327,591 @@ pub struct Cycle {
     unwind_stack: Vec<CalcId>,
     unwound: Vec<CalcId>,
     detected_at: CalcId,
-    preliminary_answers: PreliminaryAnswers,  // NEW: Per-cycle storage!
+    /// Type-erased storage for answers computed during pass 1.
+    pub preliminary_answers: TypeErasedPreliminaryAnswers,
+}
+```
+
+Update `Cycle::new()` to initialize it:
+
+```rust
+preliminary_answers: TypeErasedPreliminaryAnswers::new(),
+```
+
+### Step 4: Add Cycle Query Methods
+
+Add to the `Cycles` impl:
+
+```rust
+impl Cycles {
+    /// Check if we're currently in an active cycle (and NOT in pass 2).
+    /// Used to determine whether to write to preliminary_answers vs global.
+    pub fn is_in_active_cycle(&self, in_pass2: bool) -> bool {
+        !in_pass2 && !self.0.borrow().is_empty()
+    }
+
+    /// Look up a preliminary answer from active cycles' storage.
+    /// Checks all active cycles from innermost to outermost.
+    pub fn get_preliminary<K: Keyed>(
+        &self,
+        module: &ModuleInfo,
+        idx: Idx<K>,
+    ) -> Option<Arc<K::Answer>>
+    where
+        K::Answer: Any + Send + Sync + Clone,
+    {
+        // Check cycles from innermost (most recent) to outermost
+        for cycle in self.0.borrow().iter().rev() {
+            if let Some(answer) = cycle.preliminary_answers.get::<K>(module, idx) {
+                return Some(answer);
+            }
+        }
+        None
+    }
+
+    /// Record a preliminary answer in the active (innermost) cycle's storage.
+    pub fn record_preliminary<K: Keyed>(
+        &self,
+        module: &ModuleInfo,
+        idx: Idx<K>,
+        answer: Arc<K::Answer>,
+    ) where
+        K::Answer: Any + Send + Sync,
+    {
+        if let Some(cycle) = self.0.borrow().last() {
+            cycle.preliminary_answers.record(module, idx, answer);
+        }
+    }
+
+    /// Record errors associated with a CalcId in the active cycle's storage.
+    pub fn record_preliminary_errors(&self, calc_id: &CalcId, errors: ErrorCollector) {
+        if let Some(cycle) = self.0.borrow().last() {
+            cycle.preliminary_answers.record_errors(calc_id, errors);
+        }
+    }
+
+    /// Get errors associated with a CalcId from the active cycles' storage.
+    pub fn get_preliminary_errors(&self, calc_id: &CalcId) -> Option<ErrorCollector> {
+        for cycle in self.0.borrow().iter().rev() {
+            if let Some(errors) = cycle.preliminary_answers.get_errors(calc_id) {
+                return Some(errors);
+            }
+        }
+        None
+    }
+
+    /// Clear preliminary storage for a completed cycle.
+    pub fn clear_preliminary_for_cycle(&self, cycle_info: &CompletedCycleInfo) {
+        // The cycle has already been popped from the stack, but we may still have
+        // a reference to clear. In practice, we just need to ensure the storage
+        // doesn't persist after the cycle is done.
+        // This is mostly a placeholder - actual cleanup happens when cycle is popped.
+    }
+}
+```
+
+### Step 5: Add ThreadState Pass 2 Tracking
+
+Modify `ThreadState` to track both the pass 2 flag and the set of participants being recomputed:
+
+```rust
+use std::collections::HashSet;
+
+pub struct ThreadState {
+    cycles: Cycles,
+    stack: CalcStack,
+    debug: RefCell<bool>,
+    /// Track whether we're executing pass 2 recomputation.
+    in_pass2: RefCell<bool>,
+    /// Track which bindings are pass 2 participants (need to bypass propose_calculation).
+    pass2_participants: RefCell<HashSet<CalcId>>,
 }
 
-struct PreliminaryAnswers(RefCell<Option<SmallMap<ModuleInfo, SparseAnswerTable>>>);
-```
-
-**Why the `Option` wrapper?**
-
-The `Option` serves two purposes:
-1. **Lazy initialization**: Most computations aren't in cycles, so `None` short-circuits lookups
-   without allocating the map.
-2. **Clear semantics**: After pass 1, `clear()` sets it to `None`, making it explicit that
-   preliminary storage is inactive.
-
-**Key design decisions:**
-
-1. **Per-cycle ownership**: Each `Cycle` owns its `PreliminaryAnswers`. When cycle pops,
-   storage is automatically cleaned up.
-
-2. **Natural lifecycle**:
-   - Cycle created → PreliminaryAnswers created
-   - Pass 1 completes → PreliminaryAnswers cleared
-   - Cycle pops → PreliminaryAnswers destroyed
-
-3. **Nested cycle support**: Lookup checks innermost cycle first, then outer cycles, then
-   global:
-   ```rust
-   fn get_preliminary<K>(&self, idx: Idx<K>) -> Option<Arc<K::Answer>> {
-       for cycle in self.cycles().iter().rev() {  // Innermost to outermost
-           if let Some(answer) = cycle.preliminary_answers.get_idx(self.module(), idx) {
-               return Some(answer);
-           }
-       }
-       None  // Fall through to global
-   }
-   ```
-
-4. **Cross-module aware**: Uses `(ModuleInfo, Idx<K>)` keys. Works for cross-module cycles
-   because `ThreadState` (which holds the `Cycles` stack) is already threaded across
-   module boundaries.
-
-**Terminology note:**
-- **CalcId** = `(Bindings, AnyIdx)` - used for cycle detection in CalcStack (type-erased)
-- **PreliminaryAnswers key** = `(ModuleInfo, Idx<K>)` - used for storage (typed)
-- `Bindings` contains a reference to `ModuleInfo`, allowing conversion between representations
-
-### Component 2: Store-Then-Solve Pattern
-
-**The pattern for cycle breaking:**
-
-```rust
-// Store placeholder
-cycle.preliminary_answers.record(idx, placeholder);
-
-// Solve using that placeholder
-let binding = self.bindings().get(idx);
-let result = K::solve(self, binding, errors);  // Direct solve, NOT get_idx!
-```
-
-**Why this works:**
-- `K::solve(binding)` computes the binding's dependencies via `get_idx(D)`, `get_idx(E)`, etc.
-- Dependencies' `get_idx()` calls can return the placeholder (breaks recursion)
-- Calling `K::solve()` directly bypasses the cache check that `get_idx()` would perform
-
-**Key clarification:** Calling `K::solve()` directly on break_at bypasses `get_idx()`'s cache
-check for B. B's dependencies still use `get_idx()`, which triggers fresh computation because
-`preliminary_answers` was cleared, making them "not found."
-
-**Used in:**
-- Pass 1: Store T_B0, solve → T_B1
-- Pass 2: Store T_B1 in global, solve → T_B2
-- Fixpoint: Store T_Bi, solve → T_B(i+1)
-
-### Component 3: No Explicit Participant Tracking
-
-**An alternative approach** would track all bindings in the cycle: `Vec<(ModuleInfo, AnyIdx)>`.
-
-**This design avoids that:** Recomputation happens **implicitly via dependency graph**.
-
-When we call `K::solve(break_at)` in pass 2:
-- B computes and calls `get_idx(D)`
-- D not in global or preliminary → recomputes
-- D calls `get_idx(E)` → E recomputes
-- All dependencies naturally recompute
-
-**No iteration needed.** No type erasure problem. The Rust call stack drives recomputation.
-
----
-
-## Detailed Protocol
-
-### Cycle Detection
-
-```rust
-// In get_idx(), check for cycle
-match self.stack().current_cycle(current_id) {
-    None => {
-        // No cycle, proceed normally
+impl ThreadState {
+    pub fn new() -> Self {
+        Self {
+            cycles: Cycles::new(),
+            stack: CalcStack::new(),
+            debug: RefCell::new(false),
+            in_pass2: RefCell::new(false),
+            pass2_participants: RefCell::new(HashSet::new()),
+        }
     }
-    Some(cycle_detection) => {
-        // Cycle detected! Inform Cycles struct
-        let state = self.cycles().on_cycle_detected(cycle_detection);
 
-        match state {
-            CycleState::Continue => {
-                // We're part of a cycle but not the break point
-                // Keep recursing (will hit BreakHere at minimal idx)
+    pub fn is_in_pass2(&self) -> bool {
+        *self.in_pass2.borrow()
+    }
+
+    pub fn set_in_pass2(&self, value: bool) -> bool {
+        let prev = *self.in_pass2.borrow();
+        *self.in_pass2.borrow_mut() = value;
+        prev
+    }
+
+    /// Check if the given CalcId is a pass 2 participant (needs to bypass propose_calculation).
+    pub fn is_pass2_participant(&self, calc_id: &CalcId) -> bool {
+        self.pass2_participants.borrow().contains(calc_id)
+    }
+
+    /// Register bindings as pass 2 participants.
+    pub fn set_pass2_participants(&self, participants: impl IntoIterator<Item = CalcId>) {
+        let mut set = self.pass2_participants.borrow_mut();
+        set.clear();
+        set.extend(participants);
+    }
+
+    /// Clear pass 2 participants after cycle resolution completes.
+    pub fn clear_pass2_participants(&self) {
+        self.pass2_participants.borrow_mut().clear();
+    }
+}
+```
+
+### Step 6: Modify get_idx for Lookup Cascade and Pass 2 Bypass
+
+Update `get_idx` to check preliminary answers first and handle pass 2 participants:
+
+```rust
+pub fn get_idx<K: Solve<Ans>>(&self, idx: Idx<K>) -> Arc<K::Answer>
+where
+    AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    K::Answer: Any + Send + Sync + Clone,  // Additional bound for type-erased storage
+{
+    let current = CalcId(self.bindings().dupe(), K::to_anyidx(idx));
+
+    // Check preliminary answers first (from active cycles).
+    // This ensures cycle participants see tentative answers during pass 1 and pass 2.
+    if let Some(result) = self.cycles().get_preliminary(self.module(), idx) {
+        return result;
+    }
+
+    // Pass 2 participant bypass: skip propose_calculation entirely.
+    // These bindings are still in Calculating state from pass 1, but we need to recompute.
+    if self.thread_state.is_pass2_participant(&current) {
+        return self.calculate_for_pass2(current, idx);
+    }
+
+    let calculation = self.get_calculation(idx);
+    // ... rest of existing implementation
+}
+```
+
+### Step 7: Modify calculate_and_record_answer for Pass 1
+
+Update `calculate_and_record_answer` to write to preliminary storage during pass 1:
+
+```rust
+fn calculate_and_record_answer<K: Solve<Ans>>(
+    &self,
+    current: CalcId,
+    idx: Idx<K>,
+    calculation: &Calculation<Arc<K::Answer>, Var>,
+) -> Arc<K::Answer>
+where
+    AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    K::Answer: Any + Send + Sync + Clone,
+{
+    let binding = self.bindings().get(idx);
+
+    // Check if we're in an active cycle (pass 1) vs normal computation or pass 2.
+    let in_active_cycle = self.cycles().is_in_active_cycle(self.thread_state.is_in_pass2());
+
+    if in_active_cycle {
+        // Pass 1: Buffer errors (they will be discarded), store to preliminary only.
+        // DO NOT call record_value - the Calculation stays in Calculating state.
+        let discard_errors = ErrorCollector::new(self.module().dupe(), ErrorStyle::Never);
+        let answer = Arc::new(K::solve(self, binding, &discard_errors));
+
+        // Store to preliminary answers (not global Calculation).
+        self.cycles().record_preliminary(self.module(), idx, answer.clone());
+
+        // Handle cycle unwinding (but no pass 2 trigger from here).
+        self.cycles().on_calculation_finished(&current);
+
+        return answer;
+    }
+
+    // Normal path (or pass 2): Use transactional errors, write to global.
+    let local_errors = self.error_collector();
+    let (answer, did_write) = calculation
+        .record_value(K::solve(self, binding, &local_errors), |var, answer| {
+            self.finalize_recursive_answer::<K>(idx, var, answer, &local_errors)
+        });
+    if did_write {
+        self.base_errors.extend(local_errors);
+    }
+
+    // Handle cycle unwinding, which may trigger pass 2.
+    let (_, completed_cycles) = self.cycles().on_calculation_finished(&current);
+
+    // Pass 2 trigger: If any cycles completed where we were break_at, do recomputation.
+    if !self.thread_state.is_in_pass2() {
+        for cycle_info in completed_cycles {
+            if cycle_info.break_at == current {
+                self.execute_pass2_recomputation(&cycle_info, idx, &answer);
             }
-            CycleState::BreakHere => {
-                // WE are the break_at (minimal idx)
-                // Create and store placeholder NOW
-                let t_b0 = create_placeholder();  // Any or Variable::Recursive
-                self.cycles().current().preliminary_answers.record(
-                    self.module(),
-                    idx_b,
-                    t_b0.clone()
-                );
-                // Return placeholder to caller
-                return promote_to_answer(t_b0);
+        }
+    }
+
+    answer
+}
+```
+
+### Step 8: Implement Cycle Completion and Pass 2
+
+Add `CompletedCycleInfo` struct:
+
+```rust
+/// Information about a completed cycle, used to trigger pass 2 recomputation.
+#[derive(Debug)]
+pub struct CompletedCycleInfo {
+    pub break_at: CalcId,
+    /// All cycle participants (everything in unwound, including break_at).
+    pub participants: Vec<CalcId>,
+}
+```
+
+Modify `on_calculation_finished` to return completion info:
+
+```rust
+fn on_calculation_finished(&self, current: &CalcId) -> (bool, Vec<CompletedCycleInfo>) {
+    let mut stack = self.0.borrow_mut();
+    for cycle in stack.iter_mut() {
+        cycle.on_calculation_finished(current);
+    }
+
+    let mut completed_cycles = Vec::new();
+    while let Some(cycle) = stack.last_mut() {
+        if cycle.unwind_stack.is_empty() {
+            // Cycle complete! Collect all participants.
+            let participants: Vec<CalcId> = cycle.unwound.iter().cloned().collect();
+
+            completed_cycles.push(CompletedCycleInfo {
+                break_at: cycle.break_at.dupe(),
+                participants,
+            });
+
+            // NOTE: Do NOT clear preliminary_answers here - we need them for pass 2.
+            // They will be cleared after pass 2 completes.
+            stack.pop();
+        } else {
+            break;
+        }
+    }
+
+    (!stack.is_empty(), completed_cycles)
+}
+```
+
+Add the `calculate_for_pass2` method (used by get_idx for pass 2 participants):
+
+```rust
+/// Calculate a pass 2 participant without going through propose_calculation.
+/// This bypasses cycle detection since we know this binding is being recomputed.
+fn calculate_for_pass2<K: Solve<Ans>>(
+    &self,
+    current: CalcId,
+    idx: Idx<K>,
+) -> Arc<K::Answer>
+where
+    AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    K::Answer: Any + Send + Sync + Clone,
+{
+    let binding = self.bindings().get(idx);
+
+    // Use normal error collection - these errors will be committed.
+    let local_errors = self.error_collector();
+    let answer = Arc::new(K::solve(self, binding, &local_errors));
+
+    // Store in PreliminaryAnswers (will be committed to Calculation after pass 2).
+    self.cycles().record_preliminary(self.module(), idx, answer.clone());
+
+    // Store errors with the answer for later commitment.
+    self.cycles().record_preliminary_errors(&current, local_errors);
+
+    answer
+}
+```
+
+Add the pass 2 execution method:
+
+```rust
+/// Execute pass 2 recomputation for a completed cycle.
+fn execute_pass2_recomputation<K: Solve<Ans>>(
+    &self,
+    cycle_info: &CompletedCycleInfo,
+    break_at_idx: Idx<K>,
+    t_b1: &Arc<K::Answer>,
+) where
+    AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+{
+    tracing::debug!(
+        "Pass 2 recomputation: {} participants for cycle at {:?}",
+        cycle_info.participants.len(),
+        cycle_info.break_at
+    );
+
+    // Register non-break_at participants for pass 2 bypass in get_idx.
+    let pass2_participants: Vec<CalcId> = cycle_info
+        .participants
+        .iter()
+        .filter(|c| **c != cycle_info.break_at)
+        .cloned()
+        .collect();
+    self.thread_state.set_pass2_participants(pass2_participants);
+
+    // Set in_pass2 flag.
+    let prev_in_pass2 = self.thread_state.set_in_pass2(true);
+
+    // Re-solve break_at to trigger recomputation of all participants.
+    // break_at's T_B1 is still in PreliminaryAnswers, so dependencies will see it.
+    let binding = self.bindings().get(break_at_idx);
+    let local_errors = self.error_collector();
+    let t_b2 = K::solve(self, binding, &local_errors);
+
+    // Store break_at's pass 2 result and errors.
+    let break_at_current = CalcId(self.bindings().dupe(), K::to_anyidx(break_at_idx));
+    self.cycles().record_preliminary(self.module(), break_at_idx, Arc::new(t_b2.clone()));
+    self.cycles().record_preliminary_errors(&break_at_current, local_errors);
+
+    self.thread_state.set_in_pass2(prev_in_pass2);
+    self.thread_state.clear_pass2_participants();
+
+    // Now commit ALL participants to their Calculations.
+    self.commit_cycle_results(&cycle_info);
+
+    // Compare T_B1 vs T_B2 for stability monitoring.
+    let t_b1_str = format!("{}", t_b1);
+    let t_b2_str = format!("{}", t_b2);
+
+    if t_b1_str != t_b2_str {
+        tracing::warn!(
+            "Cycle resolution unstable at {:?}: T_B1='{}' != T_B2='{}'",
+            cycle_info.break_at, t_b1_str, t_b2_str
+        );
+    }
+}
+```
+
+### Step 9: Commit Cycle Results
+
+Add method to commit all cycle results after pass 2:
+
+```rust
+/// Commit all cycle participants' results from PreliminaryAnswers to Calculations.
+/// This is called after pass 2 completes.
+fn commit_cycle_results(&self, cycle_info: &CompletedCycleInfo) {
+    for calc_id in &cycle_info.participants {
+        // Get the answer and errors from PreliminaryAnswers.
+        // Use type-erased dispatch to call record_value for each participant.
+        self.commit_participant_result(calc_id);
+    }
+
+    // Clear the preliminary storage for this cycle.
+    self.cycles().clear_preliminary_for_cycle(cycle_info);
+}
+
+/// Dispatch on AnyIdx to commit a participant's result to its Calculation.
+fn commit_participant_result(&self, calc_id: &CalcId) {
+    let bindings = &calc_id.0;
+    let any_idx = &calc_id.1;
+
+    // Only handle same-module commits. Cross-module participants are handled
+    // by their own AnswersSolver when it processes the cycle.
+    if bindings.module() != self.module() {
+        return;
+    }
+
+    // Type-erased dispatch to commit each answer type.
+    // The implementation retrieves the answer from PreliminaryAnswers,
+    // calls record_value on the Calculation, and commits errors if successful.
+    match any_idx {
+        AnyIdx::Key(idx) => self.commit_typed_result::<Key>(*idx, calc_id),
+        AnyIdx::KeyExpect(idx) => self.commit_typed_result::<KeyExpect>(*idx, calc_id),
+        // ... similar for all other AnyIdx variants
+    }
+}
+
+fn commit_typed_result<K: Solve<Ans>>(&self, idx: Idx<K>, calc_id: &CalcId)
+where
+    AnswerTable: TableKeyed<K, Value = AnswerEntry<K>>,
+    BindingTable: TableKeyed<K, Value = BindingEntry<K>>,
+    K::Answer: Any + Send + Sync + Clone,
+{
+    if let Some(answer) = self.cycles().get_preliminary::<K>(self.module(), idx) {
+        let calculation = self.get_calculation(idx);
+        let (_, did_write) = calculation.record_value(
+            (*answer).clone(),
+            |var, answer| self.finalize_recursive_answer::<K>(idx, var, Arc::new(answer), &self.error_swallower()).as_ref().clone()
+        );
+        if did_write {
+            if let Some(errors) = self.cycles().get_preliminary_errors(calc_id) {
+                self.base_errors.extend(errors);
             }
         }
     }
 }
 ```
 
-**Key clarification:** The placeholder is created and stored when we reach `BreakHere` (the
-minimal idx in the cycle), not at the first detection point.
+---
 
-**See worked-example.md** for a detailed trace showing exactly when BreakHere triggers.
+## Complete Flow Example
 
-### Pass 1: Tentative Computation
+**Cycle:** A → B → A (break at A)
 
-```rust
-// After creating placeholder, we're still in K::solve(B)
-// Continue computation...
-let t_b1 = /* B's computation completes, using T_B0 for recursion */
-
-// Write T_B1 to global
-calculation(B).record_value(t_b1);
-
-// Clear preliminary answers
-self.cycles().current().preliminary_answers.clear();
-
-// At this point:
-//   B → T_B1 (global)
-//   D, E, F → nothing (were in preliminary, now cleared)
+**Pass 1:**
+```
+1. get_idx(A) → propose_calculation → A: Calculating
+2. K::solve(A) calls get_idx(B)
+3. get_idx(B) → propose_calculation → B: Calculating
+4. K::solve(B) calls get_idx(A)
+5. get_idx(A) sees A is Calculating with same thread → CycleDetected
+6. Store T_A0 (placeholder) in PreliminaryAnswers
+7. Return T_A0 to B
+8. B completes with T_B1 (uses T_A0)
+9. is_in_active_cycle() = true → store T_B1 in PreliminaryAnswers, B stays Calculating
+10. A completes with T_A1
+11. is_in_active_cycle() = true → store T_A1 in PreliminaryAnswers, A stays Calculating
+12. unwind_stack empties → cycle completes, CompletedCycleInfo returned
 ```
 
-**Why clearing enables pass 2 recomputation:**
-
-Clearing removes D, E, F from thread-local storage. When pass 2 calls `get_idx(D)`:
-1. Check preliminary_answers → None (cleared)
-2. Check global Calculation(D) → NotCalculated
-3. Call `K::solve(D)` and write to global
-
-Without clearing, D would be found in preliminary_answers, preventing recomputation.
-
-### Pass 2: Canonical Computation
-
-```rust
-// Explicitly recompute B to get official answers for D, E, F
-let binding_b = self.bindings().get(idx_b);
-let t_b2 = K::solve(self, binding_b, errors);  // Direct solve, bypasses get_idx
-
-// During K::solve(B):
-//   B's computation calls self.get_idx(idx_d)
-//   get_idx(D) flow:
-//     1. Check preliminary_answers → None (cleared)
-//     2. Check global Calculation(D) → NotCalculated
-//     3. Call K::solve(D) and write result to global
-//   D's computation calls self.get_idx(idx_b)
-//   get_idx(B) flow:
-//     1. Check preliminary_answers → None
-//     2. Check global Calculation(B) → Calculated(T_B1)
-//     3. Return T_B1
-//   D completes → written to global
-//   E, F follow same pattern...
-//   B completes → t_b2
-
-// Stability check
-if t_b2 != t_b1 {
-    emit_warning("Cycle resolution unstable at {:?}", idx_b);
-}
-
-// Keep T_B1 (already in global), discard T_B2
+**Transition to Pass 2:**
+```
+13. T_A1 remains in PreliminaryAnswers (NOT cleared yet)
+14. Register B as pass2_participant in ThreadState
+15. set_in_pass2(true)
 ```
 
-### Cycle Cleanup
-
-```rust
-// Pop cycle from stack
-self.cycles().pop();
-
-// PreliminaryAnswers automatically destroyed (owned by Cycle)
+**Pass 2:**
 ```
+16. K::solve(A) - calling directly, not via get_idx
+17. K::solve(A) calls get_idx(B)
+18. get_idx(B) → check PreliminaryAnswers (empty for B, T_B1 was for pass 1)
+19. get_idx(B) → is_pass2_participant(B) = true → use calculate_for_pass2
+20. calculate_for_pass2(B) calls K::solve(B)
+21. K::solve(B) calls get_idx(A)
+22. get_idx(A) → PreliminaryAnswers has T_A1 → return T_A1
+23. B completes with T_B2 (uses T_A1 - the real type!)
+24. Store T_B2 in PreliminaryAnswers, store B's errors
+25. A completes with T_A2
+26. Store T_A2 in PreliminaryAnswers, store A's errors
+27. set_in_pass2(false), clear pass2_participants
+```
+
+**Commit Phase:**
+```
+28. commit_cycle_results() for all participants
+29. For A: record_value(T_A2) → A: Calculated(T_A2), commit A's errors
+30. For B: record_value(T_B2) → B: Calculated(T_B2), commit B's errors
+31. Clear PreliminaryAnswers for this cycle
+```
+
+**Final state:**
+```
+A: Calculated(T_A2) - from pass 2
+B: Calculated(T_B2) - from pass 2
+Errors: All from pass 2 - computed with real types, no duplicates
+```
+
+**Key insight:** Calculations are NEVER reset. They stay in `Calculating` state
+throughout pass 1 and pass 2. Only after pass 2 completes do we call record_value
+to transition them to `Calculated` state.
 
 ---
 
-## Nested Cycles
+## Error Handling Summary
 
-**Scenario:**
-```
-C1: A → B (break at A)
-  While computing B, detect:
-  C2: B → D (break at B)
-    While computing D, detect:
-    C3: D → F (break at D)
-```
+| Scenario | Errors From | Committed? |
+|----------|-------------|------------|
+| Pass 1 (all participants) | Pass 1 computation | No (ErrorStyle::Never discards) |
+| Pass 2 (all participants) | Pass 2 recomputation | Yes (stored, then committed in commit phase) |
 
-**Cycles stack:**
-```rust
-[C1, C2, C3]  // C3 is innermost
-```
-
-**C3 Resolution:**
-- Store T_D0 in C3.preliminary_answers
-- Solve D → T_D1 (may use T_B0 from C2, T_A0 from C1)
-- Write T_D1 to global
-- Clear C3.preliminary_answers
-- Solve D → T_D2, write F, compare
-- Pop C3
-
-**C2 Resolution (resumes):**
-- B's computation continues (D now in global)
-- Complete B → T_B1
-- Write T_B1 to global
-- Clear C2.preliminary_answers
-- Solve B → T_B2, write D, E, compare
-- Pop C2
-
-**C1 Resolution (resumes):**
-- A's computation continues (B now in global)
-- Complete A → T_A1
-- Write T_A1 to global
-- Clear C1.preliminary_answers
-- Solve A → T_A2, write B, C, compare
-- Pop C1
-
-**Precision loss:** If D depends on A (outer cycle), D's final type contains T_A0
-(placeholder) which eventually becomes `Any`. This is acceptable: we solve one cycle at a
-time, accepting precision loss for complex nested scenarios.
-
-**Concrete example:**
-
-```python
-# Outer cycle C1
-def a(x):
-    return b(x)
-
-def b(x):
-    # Inner cycle C2 detected here
-    return d(x)
-
-def d(x):
-    return b(x).upper()  # Also references a(x) from outer cycle
-```
-
-**C2 resolution (inner, break at b):**
-- T_B0 = `Any` (placeholder)
-- D computes: `b(x).upper()` with T_B0 → `Any.upper()` → error or `Any`
-- D also calls `a(x)` → returns T_A0 from C1 (also `Any`)
-- T_D1 = `Any` (committed during C2)
-
-**C1 resolution (outer, break at a):**
-- T_A1 might resolve to `str` based on usage elsewhere
-- But D already committed with type `Any` (from C2)
-
-**Result:** D's type is `Any` instead of the more precise `str -> str`.
-
-**User-visible effect:**
-```python
-result = d("hello")
-result.lower()  # Error: "lower not found on Any"
-# Should work if d's type was str → str
-```
-
-**This is acceptable:** Deep nested cycles are rare. Users can add type annotations.
+**Key insight:** All errors come from pass 2, which computes with real types (T_B1)
+instead of placeholders (T_B0). Each binding's errors are committed exactly once
+during the commit phase after pass 2 completes.
 
 ---
 
-## How This Design Avoids Potential Pitfalls
+## Files to Modify
 
-### Pitfall #1: Complex Transaction Lifecycle
-**Risk:** Explicit transaction `begin()` and `end()` calls are error-prone.
-**Solution:** No explicit transaction! Cycle creation/destruction is the lifecycle. Begin = push
-Cycle, end = pop Cycle. The existing `Cycle` struct naturally owns the transaction state.
+1. **`pyrefly_graph/src/sparse_index_map.rs`** (new file)
+   - `SparseIndexMap<K, V>` struct
 
-### Pitfall #2: Tracking Cycle Participants
-**Risk:** Tracking which bindings participate in a cycle requires invasive changes to
-`record_value()` and introduces type erasure problems.
-**Solution:** No participant tracking needed. Recomputation is lazy via dependency graph.
-When we call `K::solve(break_at)` in pass 2, all dependencies naturally recompute.
+2. **`pyrefly_graph/src/lib.rs`**
+   - Export `sparse_index_map` module
 
-### Pitfall #3: Cross-Module Recomputation
-**Risk:** `AnswersSolver` is per-module—how to recompute bindings in other modules?
-**Solution:** `K::solve(break_at)` naturally calls `get_idx()` for dependencies. Each
-dependency recomputes in its own module's context as part of the dependency chain.
-No special cross-module coordinator needed.
+3. **`pyrefly/lib/binding/binding.rs`**
+   - Add `Send + Sync + 'static` bounds to `Keyed::Answer`
 
-### Pitfall #4: Type Erasure with AnyIdx
-**Risk:** Can't call `K::solve()` on type-erased `AnyIdx`, which would be needed if we
-iterated over cycle participants.
-**Solution:** No need to iterate type-erased participants. Only call `K::solve()` on
-break_at, which has a known type. The call graph handles the rest.
-
-### Pitfall #5: Heterogeneous Storage
-**Risk:** Rust's type system makes it hard to store heterogeneous `Idx<K>` for iteration.
-**Solution:** Don't store them for iteration. Only store in `PreliminaryAnswers` which uses
-the `table!` macro for heterogeneous storage, same as global `Answers`. No new patterns needed.
-
-### Pitfall #6: Error Collector Complexity
-**Risk:** Tentative error suppression requires threading "tentative mode" through the entire
-call chain.
-**Solution:** Addressed in Phase 2 with a simpler approach: errors are stored exactly once
-per binding—when the final `Calculation` result is recorded during pass 2. Pass 1 errors
-are simply discarded. See "Implementation Phases" section.
-
-### Pitfall #7: Invasive Protocol Changes
-**Risk:** Cycle isolation could require rearchitecting the `Calculation` proposal/record
-protocol.
-**Solution:** Minimal changes. Only add:
-  - PreliminaryAnswers to `Cycle` struct
-  - Lookup precedence (preliminary before global)
-  - Pass 2 solve call after pass 1
+4. **`pyrefly/lib/alt/answers_solver.rs`**
+   - Add `TypeErasedKey` struct
+   - Add `TypeErasedPreliminaryAnswers` struct with error storage
+   - Add `preliminary_answers` field to `Cycle`
+   - Add `CompletedCycleInfo` struct
+   - Add `is_in_active_cycle()`, `get_preliminary()`, `record_preliminary()` to `Cycles`
+   - Add `record_preliminary_errors()`, `get_preliminary_errors()`, `clear_preliminary_for_cycle()` to `Cycles`
+   - Add `in_pass2` flag and `pass2_participants` set to `ThreadState`
+   - Add `is_pass2_participant()`, `set_pass2_participants()`, `clear_pass2_participants()` to `ThreadState`
+   - Modify `get_idx` for lookup cascade and pass 2 bypass
+   - Modify `calculate_and_record_answer` for pass 1 behavior
+   - Add `calculate_for_pass2()` method
+   - Modify `on_calculation_finished` to return `CompletedCycleInfo`
+   - Add `execute_pass2_recomputation()`
+   - Add `commit_cycle_results()`, `commit_participant_result()`, `commit_typed_result()`
 
 ---
 
-## Implementation Plan
+## Testing Strategy
 
-The stages below map to the three implementation phases:
-- **Stages 1-4**: Phase 1 (Isolation & Computation Order)
-- **Stage 5**: Phase 2 (Error Determinism)
-- **Stage 6**: Phase 3 (Simplification)
-
-### Stage 1: Port PreliminaryAnswers Infrastructure
-
-**Goal:** Get the basic storage working.
-
-**Tasks:**
-1. Port `SparseIndexMap` from uncommitted stack (commit 844f311)
-2. Port `PreliminaryAnswers` struct (commit e74dd662)
-3. Add `preliminary_answers: PreliminaryAnswers` to `Cycle` struct
-4. Implement lookup cascade (check preliminary before global) in `get_idx()`
-5. Add tests verifying preliminary lookups work
-
-**Deliverable:** Infrastructure exists but isn't used yet (no cycle breaking changes).
-
-**Success criteria:**
-- Code compiles
-- Tests pass
-- No regressions
-
-### Stage 2: Single-Cycle Prototype (2-3 weeks)
-
-**Goal:** Get two-pass protocol working for single (non-nested) cycles.
-
-**Tasks:**
-1. Modify cycle detection to store placeholder in `Cycle.preliminary_answers`
-2. After pass 1, write T_B1 to global, clear `preliminary_answers`
-3. Implement pass 2: call `K::solve(break_at)` for stability check
-4. Add warning if T_B1 != T_B2
-5. Add tests with single-module, single-cycle scenarios
-
-**Key challenge:** Figure out the exact sequence of calls for pass 2. Need to ensure:
-- B is in global with T_B1
-- D, E, F are NOT in global (were cleared)
-- `K::solve(B)` actually recomputes (doesn't just return T_B1)
-
-**Deliverable:** Single cycles are deterministic.
-
-**Success criteria:**
-- Tests with cycles show same results across runs
-- Telemetry shows acceptable overhead (<10% slowdown)
-- No deadlocks or correctness bugs
-
-### Stage 3: Nested Cycles (2-3 weeks)
-
-**Goal:** Handle nested cycles correctly.
-
-**Tasks:**
-1. Verify lookup cascade works for nested preliminary_answers
-2. Add tests with nested cycles (C2 inside C1)
-3. Add tests with cross-module cycles
-4. Verify precision loss is acceptable (document examples)
-
-**Deliverable:** Nested cycles are deterministic.
-
-**Success criteria:**
-- Tests with nested cycles show same results across runs
-- No panics or infinite loops
-- Precision loss is documented and acceptable
-
-### Stage 4: Production Hardening (2-3 weeks)
-
-**Goal:** Make it production-ready.
-
-**Tasks:**
-1. Add telemetry:
-   - Cycle frequency and depth distribution
-   - Instability warnings (how often T_B1 != T_B2)
-   - Performance overhead
-2. Handle edge cases:
-   - Recursion limits during pass 2
-   - Panics in `K::solve()`
-   - Very large cycles (performance cliffs)
-3. Documentation and code review
-4. A/B testing on internal codebase
-
-**Deliverable:** Ready to ship.
-
-**Success criteria:**
-- No known correctness bugs
-- Performance acceptable (<20% slowdown in worst case)
-- Telemetry shows nondeterminism is eliminated
-
-### Stage 5: Error Determinism (Phase 2)
-
-**Goal:** Store errors exactly once per binding.
-
-**Tasks:**
-1. Modify error collection to buffer errors during pass 1
-2. Discard pass 1 errors after pass 1 completes
-3. Record errors during pass 2 alongside `record_value()`
-4. Verify errors reference T_B1, not T_B0
-
-**Success criteria:**
-- Error messages don't reference placeholder types
-- Each binding's errors stored exactly once
-- No duplicate or conflicting errors
-
-### Stage 6: Simplification (Phase 3)
-
-**Goal:** Simplify placeholder mechanism.
-
-**Tasks:**
-1. Evaluate whether `Variable::Recursive` is still needed
-2. Evaluate whether `Variable::LoopRecursive` is still needed
-3. If possible, replace `Recursive` with simple `Any` placeholder
-4. If possible, replace `LoopRecursive` with loop prior as placeholder
-5. Remove unused complexity from solver
-6. Verify no regression in type quality
-
-**Success criteria:**
-- Simpler code (fewer Variable variants)
-- Same or better type inference
-- Determinism maintained
-
----
-
-## Future Work: Fixpoint Iteration
-
-The two-pass protocol can be extended to a fixpoint approach:
-
-```rust
-let mut t_prev = create_placeholder();
-cycle.preliminary_answers.record(idx, t_prev);
-
-let binding = self.bindings().get(idx);
-let errors = &self.error_collector;
-
-for iteration in 1..=MAX_ITERATIONS {
-    let t_curr = K::solve(self, binding, errors);
-
-    if t_curr == t_prev {
-        // Converged!
-        global.record_value(idx, t_curr);
-        break;
-    }
-
-    // Store for next iteration
-    cycle.preliminary_answers.record(idx, t_curr);  // Overwrite
-    t_prev = t_curr;
-}
-
-if !converged {
-    warn!("Cycle did not converge in {MAX_ITERATIONS} iterations");
-    global.record_value(idx, t_prev);  // Best effort
-}
-
-// Pass N+1: Official computation for rest of cycle
-cycle.preliminary_answers.clear();
-K::solve(self, binding, errors);  // Writes all dependencies to global
-```
-
-**Differences from two-pass:**
-- Iterations store results in `preliminary_answers` (not global)
-- Final converged result commits to global
-- Last pass (N+1) computes official answers for dependencies
-
-**Benefits:**
-- Better precision (more iterations to refine types)
-- Explicit convergence detection
-
-**Costs:**
-- More computation (N iterations instead of 2)
-- Complexity (need to define equality, MAX_ITERATIONS)
-
-**Recommendation:** Ship two-pass first, add fixpoint later based on telemetry showing
-instability warnings are frequent.
-
----
-
-## Implementation Phases
-
-The implementation is divided into three phases, each building on the previous:
-
-### Phase 1: Isolation & Computation Order
-
-**Goal:** Get cycle isolation and the two-pass protocol working correctly.
-
-**Focus:**
-- Implement PreliminaryAnswers and per-cycle storage
-- Establish correct computation order (pass 1 with placeholder, pass 2 with T_B1)
-- Ensure answers are only visible to the resolving thread during cycle resolution
-- Keep `Variable::Recursive` as-is for placeholders
-
-**Error handling:** Deferred entirely. Errors may still reference unsolved Vars—that's
-acceptable for this phase. The goal is to prove the isolation and computation order work.
-
-**Success criteria:**
-- Cycle answers are deterministic across runs
-- No Var leakage to other threads during resolution
-- Pass 2 correctly recomputes dependencies
-
-### Phase 2: Error Determinism
-
-**Goal:** Ensure errors are stored exactly once per binding, when the final result is recorded.
-
-**Focus:**
-- Errors from pass 1 (tentative computation) are discarded
-- Errors from pass 2 (canonical computation) are kept and stored with the `Calculation`
-- Each binding's errors are recorded exactly once: when `record_value()` commits to global
-
-**Key insight:** By only storing errors during pass 2, we ensure errors are based on T_B1
-(the committed type), not T_B0 (the placeholder). This makes errors more meaningful.
-
-**Note:** This doesn't guarantee errors are completely Var-free. In edge cases (especially
-with nested cycles referencing outer placeholders), some Vars may still appear. But the
-architecture makes Var-free errors the common case.
-
-**Success criteria:**
-- Errors reference resolved types, not placeholders
-- Each binding's errors stored exactly once
-- Error messages are meaningful and actionable
-
-### Phase 3: Simplification
-
-**Goal:** Simplify the placeholder mechanism now that isolation and error handling are solid.
-
-**Focus:**
-- Revisit `Variable::Recursive` and evaluate if it's still needed
-- Revisit `Variable::LoopRecursive` similarly (use loop prior as placeholder instead)
-- Goal: Replace with simpler placeholders (e.g., `Any` for recursive, loop prior for loops)
-- Remove complexity that was only necessary for the old non-isolated approach
-
-**Rationale:** With phases 1 and 2 working, the placeholder's job is simpler. It just needs
-to break recursion during pass 1. We don't need sophisticated recursive type handling if
-we're always recomputing in pass 2 with the real type.
-
-**Success criteria:**
-- Simpler codebase (fewer Variable variants or simpler handling)
-- No regression in type inference quality
-- Maintained determinism guarantees
+1. **Single-thread cycle test:** Verify T_B1 vs T_B2 comparison works
+2. **Multi-thread cycle test:** Verify only one thread's errors committed
+3. **Nested cycle test:** Verify inner cycles resolve before outer
+4. **Cross-module cycle test:** Verify cycles spanning modules work
 
 ---
 
 ## Open Questions
 
-### Q1: Verify Pass 2 Recomputation Mechanism
+### Q1: Thread safety with in_pass2 flag and pass2_participants?
 
-Pass 2 calls `K::solve(B)` directly (not `get_idx(B)`). This should work because:
+Both the `in_pass2` flag and `pass2_participants` set are per-thread (in ThreadState via RefCell).
+No races because each thread has its own ThreadState.
 
-1. `K::solve(B)` computes B's dependencies via `get_idx(D)`, `get_idx(E)`, etc.
-2. D, E, F are NOT in global (preliminary was cleared)
-3. `get_idx(D)` sees NotCalculated → calls `K::solve(D)` → writes to global
-4. Fresh computation triggered for all dependencies
+### Q2: What if pass 2 discovers different cycles?
 
-**No special forcing mechanism needed.** The cleared preliminary_answers naturally causes
-recomputation.
-
-**To verify in Stage 2:** Add telemetry to confirm dependencies are recomputed (not cached).
-Check that the number of solve calls matches expectations.
-
-### Q2: What About LoopRecursive?
-
-`Variable::LoopRecursive` is used for loop Phi nodes. Does it need the same two-pass
-treatment as `Variable::Recursive`?
-
-**Answer:** Yes, `LoopRecursive` variables are only created when we encounter a cycle, so
-they are relevant to this design.
-
-**Phases 1 and 2:** Leave `LoopRecursive` handling as-is, same as `Recursive`. The two-pass
-protocol applies equally—we're just isolating and recomputing, regardless of the placeholder
-type.
-
-**Phase 3:** As part of simplification, we'll likely remove `Variable::LoopRecursive` entirely
-and use a simple placeholder. The key difference from `Recursive`: instead of using `Any` as
-the placeholder (T_B0), we use the **loop prior** as the initial guess. This preserves the
-loop's type refinement behavior while eliminating the `LoopRecursive` variant.
-
-### Q3: Control Flow Divergence in Pass 2
-
-What if T_B1 changes control flow vs T_B0, causing pass 2 to discover different cycles?
-
-**Example:**
-```python
-def b(x):
-    if isinstance(x, SomeClass):
-        return d(x)  # Cycle C2
-    else:
-        return e(x)  # Different cycle C3
-```
-
-**Pass 1:** T_B0 = `Any`, takes `else` branch → C3
-**Pass 2:** T_B1 = `SomeClass`, takes `if` branch → C2
-
-**Answer:** This is fine. Pass 2 uses the same cycle detection protocol as pass 1:
-- C2 is detected during pass 2
-- Nested cycle protocol applies (store placeholder, solve, commit)
-- C2 completes before B's pass 2 finishes
-- Final result: B's dependencies based on C2 (from pass 2), not C3 (from pass 1)
-
-**Key insight:** The pass 2 result determines the official results for B's dependencies. If
-pass 2 discovers different cycles, those cycles' results are final. This is still consistent:
-all of C2's bindings see the same value for B (T_B1 from pass 2's context).
+If T_A1 changes control flow and pass 2 discovers cycle C2 instead of the original C1,
+that's fine. C2 goes through the normal cycle resolution protocol. The final results
+are based on whatever cycles pass 2 discovers.
 
 ---
 
-## Risk Assessment
+## Implementation Order
 
-| Risk | Likelihood | Impact | Mitigation |
-|------|------------|--------|------------|
-| Pass 2 recomputation mechanism is tricky | Medium | High | Prototype in Stage 2, design carefully |
-| Performance overhead is unacceptable | Low | High | Telemetry in Stage 2, optimize if needed |
-| Nested cycles have edge cases | Medium | Medium | Extensive testing in Stage 3 |
-| Error buffering adds complexity (Phase 2) | Medium | Medium | Keep simple: discard pass 1 errors entirely |
-| Variable::Recursive removal breaks edge cases (Phase 3) | Low | Medium | Keep as fallback if simplification fails |
-| Rust borrow checker issues with Cycle ownership | Low | Medium | Refactor if needed |
-
-**Overall risk:** **Medium**. The design is straightforward, but pass 2 mechanics need
-careful implementation.
-
-**Estimated probability of success:** **80%**.
-
----
-
-## Design Strengths
-
-**Simplicity:**
-- No explicit transaction state management
-- No explicit participant tracking
-- No cross-module coordinator
-- No type-preserving closures
-
-**Correctness:**
-- Lazy recomputation via dependency graph (can't miss participants)
-- Per-cycle storage (automatic cleanup on pop)
-- Store-then-solve pattern (clear recursion breaking)
-
-**Performance:**
-- Only 2 full traversals per cycle
-- No overhead when not in cycles (common case)
-
-**Implementation:**
-- Builds on existing `Cycle` infrastructure
-- Minimal changes to `get_idx()` logic
-- No new global state
+1. **Step 1:** Add SparseIndexMap (new file, low risk)
+2. **Step 2:** Add `Send + Sync + 'static` bounds to `Keyed::Answer`
+3. **Step 3:** Add `TypeErasedPreliminaryAnswers` with error storage
+4. **Step 4:** Add `preliminary_answers` to Cycle
+5. **Step 5:** Add `in_pass2` flag and `pass2_participants` set to ThreadState
+6. **Step 6:** Add `is_in_active_cycle()`, `get_preliminary()`, `record_preliminary()` to Cycles
+7. **Step 7:** Modify `get_idx` for lookup cascade and pass 2 bypass
+8. **Step 8:** Modify `calculate_and_record_answer` for pass 1 behavior
+9. **Step 9:** Add `calculate_for_pass2()` method
+10. **Step 10:** Modify `on_calculation_finished` to return CompletedCycleInfo
+11. **Step 11:** Add `execute_pass2_recomputation()` method
+12. **Step 12:** Add `commit_cycle_results()` and related commit methods
+13. **Test:** Run test suite, verify no regressions
 
 ---
 
-## Conclusion
+## Success Criteria
 
-This design achieves cycle determinism through:
-1. Moving PreliminaryAnswers to per-cycle ownership
-2. Using lazy dependency-driven recomputation
-3. Establishing the pass-N-uses-pass-N-1 invariant
-
-**Next step:** Implement Stage 1 (port infrastructure).
-
-**Expected outcome:** Eliminates nondeterminism in cycle resolution, making Pyrefly's type
-inference predictable and deterministic.
+- All existing tests pass
+- No duplicate errors for cycle bindings
+- T_B1 vs T_B2 comparisons logged for monitoring
+- Errors reference resolved types (T_B1), not placeholders (T_B0)
+- Calculations are never reset - they transition NotCalculated → Calculating → Calculated exactly once
+- All cycle resolution happens in thread-local PreliminaryAnswers before committing to Calculations
