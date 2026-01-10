@@ -7,6 +7,11 @@ information is available. This causes false negatives when branches have
 termination keys (potential `Never`/`NoReturn` calls) that aren't yet known to
 actually terminate.
 
+See https://github.com/facebook/pyrefly/issues/2055 for an issue that tracks this
+partially (although the issue only addresses Never/NoReturn because as of filing it
+we don't have exhaustive match landed yet - the fundamental problem is the same
+for both cases).
+
 ### Example: False Negative
 
 ```python
