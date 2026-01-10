@@ -165,6 +165,16 @@ pushed/popped.
 
 **Sources:** P2108270570, P2108272595, P2108274049, P2108279227
 
+**Important context:** These stack traces come from BEFORE duplicate cycle detection
+was added to the codebase. The duplicate detection (`DuplicateCycleDetected` at
+`MAXIMUM_CYCLE_DEPTH=100`) was added as a safety net after these crashes were observed.
+
+**The key question we're investigating:** Can duplicate cycles actually occur on trunk
+today? If so, the duplicate detection is actively preventing stack overflows, and the
+underlying issue still exists. If duplicates can't occur, then either:
+1. Some other fix resolved the root cause, or
+2. The original analysis of what caused these crashes was incorrect
+
 ### Key Findings
 
 **Two distinct patterns observed:**
@@ -434,3 +444,183 @@ practical effect (stack overflow) is the same.
 
 The stack overflows are real, but they represent **very deep bounded recursion**
 rather than **truly infinite recursion**.
+
+---
+
+## CORRECTED: `current_cycle()` Analysis
+
+**Location:** `answers_solver.rs` in `CalcStack::current_cycle()`
+
+### The Actual Code
+
+```rust
+pub fn current_cycle(&self) -> Option<Vec1<CalcId>> {
+    let stack = self.0.borrow();
+    let mut rev_stack = stack.iter().rev();  // REVERSE iteration
+    let current = rev_stack.next()?;          // Get last element (current)
+    let mut cycle = Vec1::with_capacity(current.dupe(), rev_stack.len());
+    for c in rev_stack {                      // Walk BACKWARDS
+        if c == current {                     // Stop at FIRST match found
+            return Some(cycle);               // (which IS the nearest occurrence)
+        }
+        cycle.push(c.dupe());
+    }
+    None
+}
+```
+
+### CORRECTION: Earlier Analysis Was Wrong
+
+An earlier version of this document incorrectly claimed that `current_cycle()`
+finds the FIRST occurrence. **This was wrong.**
+
+The code iterates in REVERSE order, starting from the current element and walking
+backwards. It stops at the first match it finds - which IS the nearest occurrence.
+
+**Example:** CalcStack = `[E, A, Z, A, E, A]` (positions 0-5)
+- `current` = A (position 5)
+- Walking backwards: E (pos 4), A (pos 3) ← **STOP here!**
+- Returns cycle `[A, E]` representing A→E→A (positions 3-5)
+- Does NOT return `[A, Z, A, E, A]` (positions 1-5)
+
+So `current_cycle()` correctly finds the **smallest/nearest** cycle.
+
+---
+
+## Multi-Cycle Pop: Necessary for Correctness
+
+**Location:** `CycleStack::on_calculation_finished` in `answers_solver.rs:406-414`
+
+```rust
+fn on_calculation_finished(&self, current: &CalcId) -> bool {
+    let mut stack = self.0.borrow_mut();
+    for cycle in stack.iter_mut() {           // Iterates ALL cycles
+        cycle.on_calculation_finished(current);
+    }
+    // ...
+}
+```
+
+### Why Multi-Cycle Pop Is Necessary
+
+When a cycle is detected with `break_at ≠ detected_at`, we get `Continue`. This
+means the current Rust stack frame keeps executing while being added to a new
+cycle's unwind_stack.
+
+But this same stack frame may ALREADY be part of an earlier cycle's unwind_stack.
+The same computation participates in multiple overlapping cycles simultaneously.
+
+**Example:** CalcStack `[E, A, Z, A, E, A]`, detecting cycle `[A, E]`:
+- If break_at ≠ detected_at → Continue
+- The frame computing A (at position 5) continues executing
+- This frame was already in Cycle1's unwind_stack (from the Z→A cycle)
+- Now it's also in Cycle2's unwind_stack
+
+When this A computation finishes, it must be popped from BOTH cycles. The
+multi-cycle pop is **necessary for correctness**, not a hack or workaround.
+
+### Implication
+
+Overlapping cycles are **expected behavior** given how cycle detection works.
+The multi-cycle pop correctly handles this. The question of what causes stack
+overflow is separate from this mechanism.
+
+---
+
+## Remaining Mystery: Root Cause of Stack Overflow
+
+We still don't have a clear explanation for what caused the stack overflows
+observed in production (P2108270570, P2108272595, P2108274049, P2108279227).
+
+**What we know:**
+1. Stack overflows occurred before duplicate detection was added
+2. Traces show repeating patterns through KeyClassSynthesizedFields → KeyDecorator → KeyAnnotation
+3. Multiple different stack trace patterns were observed
+4. The multi-cycle pop is necessary for correctness (not compensating for a bug)
+
+**Hypotheses that were ruled out:**
+- ~~`current_cycle()` using first occurrence instead of nearest~~ (code actually uses nearest)
+
+**Remaining hypotheses:**
+1. **`pre_calculate_state` bug**: Doesn't check `unwind_stack`, only `break_at` and
+   `recursion_stack.last()`. During unwind phase, accessing bindings in unwind_stack
+   returns `NoDetectedCycle`, then `propose_calculation` returns `CycleDetected`,
+   creating overlapping cycles.
+
+2. **O(N²) bounded growth**: With N bindings, we could have O(N) nested cycles,
+   each with O(N) stack frames. For large codebases, O(N²) stack usage could
+   exceed the default ~8MB stack limit even without infinite recursion.
+
+3. **Specific code patterns**: Some Python patterns might create unusually deep
+   cycle nesting that triggers the issue more readily.
+
+**To investigate further:**
+- Add instrumentation to trace cycle behavior in pyrefly
+- Find actual repro cases from production logs
+- Analyze whether the `pre_calculate_state` fix would prevent the issue
+
+---
+
+## O(N²) Complexity Example
+
+Here's a concrete graph structure that demonstrates worst-case O(N²) stack usage
+due to the `pre_calculate_state` bug.
+
+### Graph Structure (N=5)
+
+Nodes A, B, C, D, E in lexicographic (Idx) order. Each node depends on only the
+next node, except the last which depends on all previous nodes:
+
+```
+A → B
+B → C
+C → D
+D → E
+E → A, B, C, D  (lookups in order)
+```
+
+### Trace
+
+1. Computing E, CalcStack grows: `[E, A, B, C, D, E]`
+2. **Cycle1** detected: `[E, A, B, C, D]` (5 nodes), break_at = A
+3. Continue (A ≠ E), E's computation continues with A's placeholder
+4. E accesses B - B is in Cycle1 but not recognized by `pre_calculate_state`
+   (B is not break_at, not recursion_stack.last())
+5. **Cycle2** detected: `[B, C, D, E]` (4 nodes), break_at = B
+6. E accesses C - same issue
+7. **Cycle3** detected: `[C, D, E]` (3 nodes), break_at = C
+8. E accesses D - same issue
+9. **Cycle4** detected: `[D, E]` (2 nodes), break_at = D
+
+### Stack Frame Count
+
+Total frames: 5 + 4 + 3 + 2 = 14 ≈ N²/2
+
+For N nodes in this pattern, we get approximately N²/2 stack frames. With a
+component of hundreds of bindings, this easily exceeds typical stack limits.
+
+### Caveats and Reasons for Doubt
+
+**This O(N²) analysis may be incorrect or irrelevant:**
+
+1. **Doesn't match actual tracebacks**: Tracing through the example more carefully,
+   after the first `Continue`, subsequent accesses to B, C, D each trigger cycles
+   where `detected_at == break_at` (because the detected element IS the minimum
+   of the remaining cycle). This gives `BreakHere`, not `Continue`, so we don't
+   get nested recursive calls. The repeating frame patterns in production traces
+   don't obviously match this structure.
+
+2. **Real-world probability**: Even if O(N²) is possible in theory, it requires
+   both long cycles AND worst-case ordering (the "hub" node that depends on all
+   others must be processed last). If real-world dependency graphs resemble random
+   graphs, the probability of hitting worst-case ordering likely drops toward zero
+   as the graph grows. We have no evidence that real codebases produce this pattern.
+
+3. **BreakHere dominates**: In practice, many cycle detections result in `BreakHere`
+   (when `detected_at == break_at`), which records a placeholder immediately without
+   adding stack frames. The conditions for `Continue` (detected_at ≠ break_at) may
+   be rarer than this analysis assumes.
+
+**Conclusion**: We have a plausible theoretical explanation for how O(N²) stack
+usage could occur, but significant doubt remains about whether this mechanism
+explains the actual production crashes. Further investigation is needed.
